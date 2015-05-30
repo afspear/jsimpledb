@@ -51,14 +51,12 @@ import org.jsimpledb.JSetField;
 import org.jsimpledb.JSimpleField;
 import org.jsimpledb.JTransaction;
 import org.jsimpledb.ValidationException;
-import org.jsimpledb.change.ObjectCreate;
 import org.jsimpledb.core.FieldType;
 import org.jsimpledb.core.ObjId;
 import org.jsimpledb.core.Transaction;
 import org.jsimpledb.parse.ParseSession;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.transaction.UnexpectedRollbackException;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -78,9 +76,6 @@ public class JObjectEditorWindow extends ConfirmWindow {
     private final ParseSession session;
     private final FieldGroup fieldGroup = new FieldGroup();
     private final TreeMap<String, Field<?>> fieldMap = new TreeMap<>();
-
-    @Autowired(required = false)
-    private ChangePublisher changePublisher;
 
     /**
      * Constructor for creating and editing a new object.
@@ -208,14 +203,6 @@ public class JObjectEditorWindow extends ConfirmWindow {
             Notification.show("Validation failed", e.getMessage(), Notification.Type.ERROR_MESSAGE);
             jtx.getTransaction().setRollbackOnly();
             return false;
-        }
-
-        // Broadcast update event after successful commit
-        if (this.changePublisher != null) {
-            if (create)
-                this.changePublisher.publishChangeOnCommit(new ObjectCreate<Object>(target));
-            else
-                this.changePublisher.publishChangeOnCommit(target);
         }
 
         // Show notification after successful commit

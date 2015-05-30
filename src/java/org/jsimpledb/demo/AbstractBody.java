@@ -16,8 +16,13 @@ import java.io.ByteArrayInputStream;
 import org.dellroad.stuff.vaadin7.BlobField;
 import org.dellroad.stuff.vaadin7.FieldBuilder;
 import org.dellroad.stuff.vaadin7.ProvidesProperty;
+import org.jsimpledb.annotation.OnChange;
+import org.jsimpledb.annotation.OnCreate;
+import org.jsimpledb.annotation.OnDelete;
+import org.jsimpledb.change.Change;
 import org.jsimpledb.gui.NullableField;
 import org.jsimpledb.gui.SizedLabel;
+import org.jsimpledb.util.ChangeSummary;
 
 /**
  * Support superclass for {@code Body} implementations.
@@ -30,6 +35,25 @@ public abstract class AbstractBody implements Body {
     @Override
     public String toString() {
         return this.getClass().getName() + "@" + this.getObjId();
+    }
+
+// Change notifications
+
+    // Here we show an example of notifying ChangeSummary listeners when any changes are committed
+
+    @OnCreate
+    private void onCreate() {
+        ChangeSummary.recordChange(this.getObjId(), ChangeSummary.ChangeType.CREATED);
+    }
+
+    @OnDelete
+    private void onDelete() {
+        ChangeSummary.recordChange(this.getObjId(), ChangeSummary.ChangeType.DELETED);
+    }
+
+    @OnChange
+    private void onChange(Change<?> change) {
+        ChangeSummary.recordChange(this.getObjId(), ChangeSummary.ChangeType.CHANGED);
     }
 
 // Vaadin GUI customizations

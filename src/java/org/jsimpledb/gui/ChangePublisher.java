@@ -5,84 +5,92 @@
 
 package org.jsimpledb.gui;
 
-import org.dellroad.stuff.vaadin7.VaadinConfigurable;
-import org.jsimpledb.JObject;
-import org.jsimpledb.JTransaction;
-import org.jsimpledb.change.Change;
-import org.jsimpledb.change.SimpleFieldChange;
-import org.jsimpledb.core.ObjId;
-import org.jsimpledb.core.Transaction;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.context.event.ApplicationEventMulticaster;
+import com.vaadin.server.VaadinSession;
+
+import java.util.HashSet;
+
+import org.dellroad.stuff.spring.AbstractBean;
+import org.dellroad.stuff.spring.RetryTransaction;
+import org.dellroad.stuff.vaadin7.VaadinUtil;
+import org.jsimpledb.util.ChangeSummary;
 import org.springframework.stereotype.Component;
+import org.springframework.transaction.annotation.Transactional;
 
 /**
- * Publishes change notifications.
+ * Singleton bean that updates {@link JObjectContainer}s after each successful transaction,
+ * via {@link JObjectContainer#updateAfterChanges JObjectContainer.updateAfterChanges()}.
+ * It is assumed that this bean is contained within a single {@link VaadinSession}.
  */
 @Component
-@VaadinConfigurable
-public class ChangePublisher {
+public class ChangePublisher extends AbstractBean implements ChangeSummary.Listener {
 
-    @Autowired
-    @Qualifier("jsimpledbGuiEventMulticaster")
-    private ApplicationEventMulticaster eventMulticaster;
+protected final org.slf4j.Logger log = org.slf4j.LoggerFactory.getLogger(this.getClass());
+
+    private final HashSet<JObjectContainer> containers = new HashSet<>();
+    private final VaadinSession session = VaadinSession.getCurrent();
+
+// Lifecycle
+
+    @Override
+    public void afterPropertiesSet() throws Exception {
+        assert this.session.hasLock();
+        super.afterPropertiesSet();
+this.log.info("ChangePublisher registering self");
+        ChangeSummary.addChangeSummaryListener(this);
+    }
+
+    @Override
+    public void destroy() throws Exception {
+        assert this.session.hasLock();
+this.log.info("ChangePublisher deregistering self");
+        ChangeSummary.removeChangeSummaryListener(this);
+        super.destroy();
+    }
+
+// API
 
     /**
-     * Publish the given {@link Change} if the current transaction is successful.
+     * Register a {@link JObjectContainer} for automatic updates.
      *
      * @param change change during the current transaction
      */
-    public void publishChangeOnCommit(Change<?> change) {
-        JTransaction.getCurrent().getTransaction().addCallback(
-          new PublishChangeCallback(this.eventMulticaster, new DataChangeEvent(this, change)));
+    public void addListeningContainer(JObjectContainer container) {
+        assert this.session.hasLock();
+        this.containers.add(container);
+this.log.info("adding container " + container);
     }
 
     /**
-     * Publish that the specified object has changed if the current transaction is successful.
+     * De-register a {@link JObjectContainer} for automatic updates.
      *
      * @param jobj object changed during the current transaction
      */
-    public void publishChangeOnCommit(JObject jobj) {
-
-        // We rely here on the fact that publishing a change in any property reloads all properties for that object
-        this.publishChangeOnCommit(new SimpleFieldChange<Object, ObjId>(jobj,
-          Integer.MAX_VALUE, JObjectContainer.OBJECT_ID_PROPERTY, jobj.getObjId(), jobj.getObjId()));
+    public void removeListeningContainer(JObjectContainer container) {
+        assert this.session.hasLock();
+        this.containers.remove(container);
+this.log.info("removing container " + container);
     }
 
-// PublishChangeCallback - notifies the rest of the application when a data instance has been added/removed/changed
+// ChangeSummary.Listener
 
-    private static class PublishChangeCallback extends Transaction.CallbackAdapter {
+    @Override
+    public void notifyChanges(final ChangeSummary summary) {
+this.log.info("got changes: " + summary);
+        VaadinUtil.invoke(this.session, new Runnable() {    // to avoid deadlock, lock the session first, then create a transaction
+            @Override
+            public void run() {
+                ChangePublisher.this.notifyChangesInSession(summary);
+            }
+        });
+    }
 
-        private final ApplicationEventMulticaster eventMulticaster;
-        private final DataChangeEvent event;
-
-        PublishChangeCallback(ApplicationEventMulticaster eventMulticaster, DataChangeEvent event) {
-            if (eventMulticaster == null)
-                throw new IllegalArgumentException("null eventMulticaster");
-            if (event == null)
-                throw new IllegalArgumentException("null event");
-            this.eventMulticaster = eventMulticaster;
-            this.event = event;
-        }
-
-        @Override
-        public void afterCommit() {
-            this.eventMulticaster.multicastEvent(this.event);
-        }
-
-        @Override
-        public boolean equals(Object obj) {
-            if (obj == null || obj.getClass() != this.getClass())
-                return false;
-            final PublishChangeCallback that = (PublishChangeCallback)obj;
-            return this.event.equals(that.event);
-        }
-
-        @Override
-        public int hashCode() {
-            return this.event.hashCode();
-        }
+    @RetryTransaction
+    @Transactional("jsimpledbGuiTransactionManager")
+    private void notifyChangesInSession(ChangeSummary summary) {
+        assert this.session.hasLock();
+this.log.info("updating changes to " + ChangePublisher.this.containers);
+        for (JObjectContainer container : ChangePublisher.this.containers)
+            container.updateAfterChanges(summary);
     }
 }
 

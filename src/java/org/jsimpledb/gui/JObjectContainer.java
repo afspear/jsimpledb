@@ -16,7 +16,6 @@ import com.vaadin.ui.HorizontalLayout;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
-import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -25,9 +24,9 @@ import java.util.SortedMap;
 import org.dellroad.stuff.vaadin7.PropertyDef;
 import org.dellroad.stuff.vaadin7.PropertyExtractor;
 import org.dellroad.stuff.vaadin7.ProvidesPropertyScanner;
-import org.dellroad.stuff.vaadin7.SimpleItem;
 import org.dellroad.stuff.vaadin7.SimpleKeyedContainer;
 import org.jsimpledb.CopyState;
+import org.jsimpledb.JClass;
 import org.jsimpledb.JCollectionField;
 import org.jsimpledb.JCounterField;
 import org.jsimpledb.JField;
@@ -38,15 +37,12 @@ import org.jsimpledb.JSimpleDB;
 import org.jsimpledb.JSimpleField;
 import org.jsimpledb.JTransaction;
 import org.jsimpledb.SnapshotJTransaction;
-import org.jsimpledb.change.Change;
-import org.jsimpledb.change.ChangeAdapter;
-import org.jsimpledb.change.FieldChange;
-import org.jsimpledb.change.ObjectCreate;
-import org.jsimpledb.change.ObjectDelete;
 import org.jsimpledb.core.DeletedObjectException;
 import org.jsimpledb.core.ObjId;
+import org.jsimpledb.core.TypeNotInSchemaVersionException;
 import org.jsimpledb.core.UnknownFieldException;
-import org.jsimpledb.util.ObjIdSet;
+import org.jsimpledb.util.ChangeSummary;
+import org.jsimpledb.util.ObjIdBiMultiMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -54,14 +50,15 @@ import org.slf4j.LoggerFactory;
  * General purpose support superclass for Vaadin {@link com.vaadin.data.Container}s backed by {@link JSimpleDB} database objects.
  * Automatically creates properties for object ID, database type, version, and fields, as well as any custom properties
  * defined by {@link org.dellroad.stuff.vaadin7.ProvidesProperty &#64;ProvidesProperty}-annotated methods in Java model classes,
- * and handles {@link Change} updates of backing objects or their related objects.
+ * and updates backing objects and/or their related objects based on {@link ChangeSummary}s.
  *
  * <p>
  * Instances are configured with a <b>type</b>, which can be any Java type (including interface types). The container
  * will then be restricted to database objects that are instances of the configured type. The type may be null, in which
  * case there is no restriction. The subclass method {@linkplain #queryForObjects queryForObjects()} determines which
- * objects are actually loaded into the container. The items in the container are backed by in-memory copies of the
- * corresponding database objects that live inside a {@link org.jsimpledb.SnapshotJTransaction}.
+ * objects are actually loaded into the container. The items in the container are backed by in-memory
+ * {@link org.jsimpledb.SnapshotJTransaction} copies of the corresponding database objects, plus any related objects
+ * required (see {@link #getDependencies getDependencies()}).
  * </p>
  *
  * <p><b>Container Properties</b></p>
@@ -91,6 +88,14 @@ import org.slf4j.LoggerFactory;
  *      in the specified <b>type</b>. These properties will add to (or override) the properties listed above.
  * </ul>
  *
+ * <p>
+ * Note that {@link org.dellroad.stuff.vaadin7.ProvidesProperty &#64;ProvidesProperty}-annotated methods may access
+ * other indirectly referenced objects to generate their values. For example, consider a table of users that has
+ * an account name column: the account name would presumably come from the account object referred to by each user
+ * object, not the user object itself. This creates an indirect dependency of the container item corresponding to each
+ * user on the associated account object. See {@link #getDependencies getDependencies()}) for how to declare these dependencies.
+ * </p>
+ *
  * <p><b>Loading</b></p>
  *
  * <p>
@@ -116,27 +121,29 @@ import org.slf4j.LoggerFactory;
  * some Vaadin property depends on.
  * </p>
  *
- * <p><b>Updating Items</b></p>
+ * <p><b>Incremental Updates</b></p>
  *
  * <p>
- * Instances support updating individual items without requiring a complete container reload by invoking
- * {@link #handleChange handleChange()}. In a typical design pattern, {@link org.jsimpledb.change.Change} objects originate
- * from {@link org.jsimpledb.annotation.OnChange &#64;OnChange} methods and are broadcast (after copying into memory using
- * a {@link org.jsimpledb.change.ChangeCopier}) to listeners such as this container by a transaction synchronization callback
- * (see {@link org.jsimpledb.core.Transaction#addCallback Transaction.addCallback()}).
+ * Some common challenges with Vaadin containers backed by database records are:
+ * <ul>
+ *  <li>Determining which containers are affected by the changes in a newly committed transaction</li>
+ *  <li>Efficiently updating only the affected items in the container</li>
+ *  <li>Handling Vaadin properties that are derived from indirectly referenced objects</li>
+ * </ul>
  * </p>
  *
  * <p>
- * Moreover, this container keeps track of which related objects are associated with each backing object (according to
- * {@link #getDependencies getDependencies()}). {@link Change} events that affect a related object automatically cause
- * the corresponding backing object(s) to update.
+ * {@link JObjectContainer} supports efficient incremental updates of container items without requiring a complete
+ * container reload (if possible). The {@link #updateAfterChanges updateAfterChanges()} method takes a {@link ChangeSummary}
+ * and updates the container as needed. In one design pattern, the {@link #connect} method registers a
+ * {@link org.jsimpledb.util.ChangeSummary.Listener} to receive {@link ChangeSummary} notifications after each successfully
+ * committed transaction, and invokes {@link #updateAfterChanges updateAfterChanges()} when notifications are received.
  * </p>
  *
  * <p>
- * This class responds to the creation or deletion of a database object matching this container's configured type
- * by reloading the container; however, this is a conservative approach, as not necessarily every newly created (or
- * deleted) object should be (or was) present in the container in the first place. Subclasses may wish to optimize this
- * behavior by overriding {@link #handleObjectCreate handleObjectCreate()} and/or {@link #handleObjectDelete handleObjectDelete()}.
+ * This container keeps track of which related objects are indirectly depended on by each backing object according to
+ * {@link #getDependencies getDependencies()}. Changes that affect a dependent object automatically cause
+ * the corresponding dependent object(s) to be updated.
  * </p>
  *
  * <p><b>{@link org.dellroad.stuff.vaadin7.ProvidesProperty &#64;ProvidesProperty} Limitations</b></p>
@@ -144,10 +151,11 @@ import org.slf4j.LoggerFactory;
  * <p>
  * The use of {@link org.dellroad.stuff.vaadin7.ProvidesProperty &#64;ProvidesProperty} methods has certain implications.
  * First, if the method reads any of the object's field(s) via their Java getter methods (as would normally be expected),
- * this will trigger a schema upgrade of the object if needed; however, this schema upgrade will occur in the
+ * this will trigger an automatic schema upgrade of the object if needed. Normally this is not a problem; however, this
+ * schema upgrade will occur in the
  * container's in-memory {@link org.jsimpledb.SnapshotJTransaction} rather than in a real database transaction, so the
- * {@link #VERSION_PROPERTY} will return a different schema version from what's in the database. The automatic schema
- * upgrade can be avoided if desired by reading the field using the appropriate {@link JTransaction} field access method
+ * {@link #VERSION_PROPERTY} will show a different schema version from what's actually in the database. This automatic schema
+ * upgrade can be avoided if desired by reading fields using the appropriate {@link JTransaction} field access method
  * (e.g., {@link JTransaction#readSimpleField JTransaction.readSimpleField()}) and being prepared to handle a
  * {@link org.jsimpledb.core.UnknownFieldException} if/when the object has an older schema version that does not contain
  * the requested field.
@@ -156,9 +164,8 @@ import org.slf4j.LoggerFactory;
  * <p>
  * Secondly, because the values of reference fields (including complex sub-fields) are displayed using reference labels,
  * and these are typically derived from the referenced object's fields, those indirectly referenced objects need to be
- * copied into the container's {@link org.jsimpledb.SnapshotJTransaction} as well. The easiest way to ensure these indirectly
- * referenced objects are copied is by overriding {@link #getDependencies getDependencies()} as described above. Alternately,
- * the subclass may override {@link #copyOut copyOut()} to take complete control of copying objects into memory.
+ * copied into the container's {@link org.jsimpledb.SnapshotJTransaction} as well. To ensure these indirectly referenced
+ * objects are also copied, override {@link #getDependencies getDependencies()} as described above.
  * </p>
  */
 @SuppressWarnings("serial")
@@ -200,12 +207,13 @@ public abstract class JObjectContainer extends SimpleKeyedContainer<ObjId, JObje
     private final ObjTypePropertyDef objTypePropertyDef = new ObjTypePropertyDef();
     private final ObjVersionPropertyDef objVersionPropertyDef = new ObjVersionPropertyDef();
     private final RefLabelPropertyDef refLabelPropertyDef = new RefLabelPropertyDef();
-    private final HashMap<ObjId, ObjIdSet> dependenciesMap = new HashMap<>();       // maps object to others that depend on it
+    private final ObjIdBiMultiMap dependencyMap = new ObjIdBiMultiMap();            // maps object to its dependencies
 
     private Class<?> type;
     private int maxObjects = DEFAULT_MAX_OBJECTS;
     private ProvidesPropertyScanner<?> propertyScanner;
     private List<String> orderedPropertyNames;
+    private SnapshotJTransaction snapshotTransaction;
 
     /**
      * Constructor.
@@ -280,7 +288,8 @@ public abstract class JObjectContainer extends SimpleKeyedContainer<ObjId, JObje
      * (Re)load this container.
      *
      * <p>
-     * This method delegates to {@link #queryForObjects queryForObjects()} indirectly via {@link #doInTransaction}.
+     * This method utilizes {@link #doInTransaction doInTransaction()} to join an existing transaction
+     * or create a new one, and then invokes {@link #queryForObjects queryForObjects()} to load the backing objects.
      * </p>
      */
     public void reload() {
@@ -292,145 +301,117 @@ public abstract class JObjectContainer extends SimpleKeyedContainer<ObjId, JObje
         });
     }
 
+// Updates
+
     /**
-     * Apply the given change to this container, if applicable.
+     * Update this container as needed after the specified changes have been committed.
      *
      * <p>
-     * The changed object {@linkplain Change#getObject referred to} by {@code change} must be accessible.
-     * Unless this method is invoked from within the transaction in which the change occurred, this means that
-     * {@code change} must have been be copied out of its transaction, e.g, using a {@link org.jsimpledb.change.ChangeCopier}.
+     * This method {@linkplain #reload reloads} this container, if necessary,
+     * according to {@link #requiresReload requiresReload()}.
      * </p>
      *
-     * <p>
-     * The implementation in {@link JObjectContainer} delegates to {@link #handleObjectCreate handleObjectCreate()},
-     * {@link #handleObjectDelete handleObjectDelete()}, or {@link #handleFieldChange handleFieldChange()} as appropriate.
-     * </p>
-     *
-     * @param change change from a transaction
-     * @param <T> type of the changed object
-     * @throws IllegalArgumentException if {@code change} is null
-     * @throws org.jsimpledb.core.StaleTransactionException if {@code change} refers to a {@link JObject}
-     *  without an associated tranasction.
+     * @param summary summary of committed changes
+     * @throws IllegalArgumentException if {@code summary} is null
      */
-    public <T> void handleChange(Change<T> change) {
+    public void updateAfterChanges(final ChangeSummary summary) {
+        if (summary == null)
+            throw new IllegalArgumentException("null summary");
+        if (this.requiresReload(summary))
+            this.reload();
+    }
+
+    /**
+     * Determine whether the changes in the given {@link ChangeSummary} should cause this container to reload.
+     *
+     * <p>
+     * The implementation in {@link JObjectContainer} looks for any created, deleted, or modified object that is
+     * already contained in this container, or is depended on by any object in this container. It also examines
+     * each created object, compares its type to this container's configured type, and if it matches, reloads
+     * the container unless {@link #shouldNotBeAddedToContainer shouldNotBeAddedToContainer()} returns false.
+     * </p>
+     *
+     * @param summary summary of committed changes
+     * @return true to reload, false if no reload needed
+     * @throws IllegalArgumentException if {@code summary} is null
+     */
+    protected boolean requiresReload(ChangeSummary summary) {
 
         // Sanity check
-        if (change == null)
-            throw new IllegalArgumentException("null change");
+        if (summary == null)
+            throw new IllegalArgumentException("null summary");
 
-        // Determine whether the change concerns us
-        if (this.type != null && !this.type.isInstance(change.getObject()))
-            return;
+        // Check added objects
+        for (ObjId id : summary.getCreated()) {
 
-        // Apply change
-        change.visit(new ChangeAdapter<Void>() {
-
-            @Override
-            public <T> Void caseObjectDelete(ObjectDelete<T> change) {
-                JObjectContainer.this.handleObjectDelete(change);
-                return null;
+            // Does the new object's type exist in the current schema version?
+            final JClass<?> jclass;
+            try {
+                jclass = this.jdb.getJClass(id);
+            } catch (TypeNotInSchemaVersionException e) {
+                continue;
             }
 
-            @Override
-            public <T> Void caseObjectCreate(ObjectCreate<T> change) {
-                JObjectContainer.this.handleObjectCreate(change);
-                return null;
-            }
+            // Is the new object's type assignable to this containers's configured type?
+            if (this.type != null && !this.type.isAssignableFrom(jclass.getType()))
+                continue;
 
-            @Override
-            protected <T> Void caseFieldChange(FieldChange<T> change) {
-                JObjectContainer.this.handleFieldChange(change);
-                return null;
-            }
-        });
+            // Do we know for sure that the object should not be contained?
+            if (!this.shouldNotBeAddedToContainer(this.jdb.getJObject(id)))
+                continue;
+
+            // Reload to (possibly) add new object
+            return true;
+        }
+
+        // Check added, modified, and deleted objects
+        for (ObjId id : Iterables.concat(summary.getCreated(), summary.getChanged(), summary.getDeleted())) {
+
+            // Is the changed or deleted object in this container?
+            if (this.getItem(id) != null)
+                return true;
+
+            // Are any other objects in this container dependent on the changed or deleted object?
+            if (this.dependencyMap.getSources(id) != null)
+                return true;
+        }
+
+        // Done
+        return false;
     }
 
     /**
-     * Handle an {@link ObjectCreate} event.
+     * Determine whether a newly created object definitely does not need to be added to this container.
+     * This is allows for an optimization: if a newly added object is known to not be contained by this
+     * container, then this container can possibly avoid an unnecessary reload.
      *
      * <p>
-     * The implementation in {@link JObjectContainer} {@linkplain #reload reloads} the container.
+     * The implementation in {@link JObjectContainer} always returns false (this is a conservative default).
+     * </p>
+     *
+     * <p>
+     * This method is invoked from {@link #requiresReload requiresReload()} (and indirectly from
+     * {@link #updateAfterChanges updateAfterChanges()}); whether there is a transaction open in the current
+     * thread depends on how that method is invoked.
+     * </p>
+     *
+     * @param jobj newly created object that matches this instance's configured type
+     * @return true if {@code jobj} definitely does not need to be added, false if it does need to be, or if it can't be determined
+     */
+    protected boolean shouldNotBeAddedToContainer(JObject jobj) {
+        return false;
+    }
+
+    /**
+     * Reload entire container.
+     *
+     * <p>
+     * This method runs within a transaction.
      * </p>
      *
      * @param change change from a transaction
      * @param <T> type of the changed object
      */
-    protected <T> void handleObjectCreate(ObjectCreate<T> change) {
-        this.reload();
-    }
-
-    /**
-     * Handle an {@link ObjectDelete} event.
-     *
-     * <p>
-     * The implementation in {@link JObjectContainer} {@linkplain #reload reloads} the container.
-     * </p>
-     *
-     * @param change change from a transaction
-     * @param <T> type of the changed object
-     */
-    protected <T> void handleObjectDelete(ObjectDelete<T> change) {
-        this.reload();
-    }
-
-    /**
-     * Handle a {@link FieldChange} event.
-     *
-     * <p>
-     * The implementation in {@link JObjectContainer} triggers value change events for all affected item(s) in this container.
-     * Affected items are those whose backing object is either the changed object, or has the changed object as a dependency
-     * according to {@link #getDependencies getDependencies()}.
-     * </p>
-     *
-     * @param change change from a transaction
-     * @param <T> type of the changed object
-     */
-    protected <T> void handleFieldChange(FieldChange<T> change) {
-
-        // Check dependencies for the changed object
-        final JObject target = change.getJObject();
-        final ObjId id = target.getObjId();
-        final ObjIdSet oldDependencies = this.dependenciesMap.get(id);
-        final ObjIdSet newDependencies = new ObjIdSet(Iterables.transform(
-          Iterables.filter(this.getDependencies(target), JObject.class), new Function<JObject, ObjId>() {
-            @Override
-            public ObjId apply(JObject jobj) {
-                return jobj.getObjId();
-            }
-        }));
-        final ObjIdSet addedDependencies = newDependencies.clone();
-        if (oldDependencies != null)
-            addedDependencies.removeAll(oldDependencies);
-
-        // If any dependencies have been added, we may not have previously included them in the container so reload to be safe
-        if (!addedDependencies.isEmpty()) {
-            this.reload();
-            return;
-        }
-
-        // Update the matching backing object, if any
-        final SimpleItem<JObject> item = (SimpleItem<JObject>)this.getItem(id);
-        if (item != null) {
-            target.copyTo(item.getObject().getTransaction(), null, new CopyState());
-            item.fireValueChange();
-        }
-
-        // Update any other affected objects that are dependent on the target object
-        final ObjIdSet affectedIds = dependenciesMap.get(id);
-        if (affectedIds != null) {
-            final ObjIdSet notifiedIds = new ObjIdSet();
-            notifiedIds.add(id);
-            for (ObjId affectedId : affectedIds) {
-                final SimpleItem<JObject> affectedItem = (SimpleItem<JObject>)this.getItem(affectedId);
-                if (affectedItem != null && !notifiedIds.contains(affectedId)) {
-                    affectedItem.fireValueChange();
-                    notifiedIds.add(affectedId);
-                }
-            }
-        }
-    }
-
-    // This method runs within a transactin
     private void doReloadInTransaction() {
 
         // Get objects from subclass
@@ -446,14 +427,14 @@ public abstract class JObjectContainer extends SimpleKeyedContainer<ObjId, JObje
             });
         }
 
-        // Filter out any duplicate objects using ObjId set
-        final CopyState copyState = new CopyState();
-
         // Copy database objects out of the database transaction into my in-memory transaction as we load them
+        final JTransaction jtx = JTransaction.getCurrent();
+        this.snapshotTransaction = jtx.getSnapshotTransaction();
+        final CopyState copyState = new CopyState();
         jobjs = Iterables.transform(jobjs, new Function<JObject, JObject>() {
             @Override
             public JObject apply(JObject jobj) {
-                return JObjectContainer.this.copyOut(jobj, copyState);
+                return JObjectContainer.this.copyOutAndUpdateDependencies(jobj, copyState);
             }
         });
 
@@ -461,26 +442,55 @@ public abstract class JObjectContainer extends SimpleKeyedContainer<ObjId, JObje
         jobjs = Iterables.limit(jobjs, this.maxObjects);
 
         // Now actually load them
-        this.dependenciesMap.clear();
+        this.dependencyMap.clear();
         this.load(jobjs);
     }
 
+    private JObject copyOutAndUpdateDependencies(JObject jobj, CopyState copyState) {
+
+        // Get dependencies
+        final Iterable<? extends JObject> dependencies = this.getDependencies(jobj);
+
+        // Filter out nulls and transform to object IDs
+        final Iterable<ObjId> dependencyIds = Iterables.transform(
+          Iterables.filter(dependencies, JObject.class), new Function<JObject, ObjId>() {
+            @Override
+            public ObjId apply(JObject jobj) {
+                return jobj.getObjId();
+            }
+        });
+
+        // Update tracking info for object
+        final ObjId id = jobj.getObjId();
+        this.dependencyMap.removeAll(id);
+        this.dependencyMap.addAll(id, dependencyIds);
+
+        // Copy out object and dependencies
+        return JObjectContainer.this.copyOut(jobj, dependencies, JObjectContainer.this.snapshotTransaction, copyState);
+    }
+
     /**
-     * Copy the given database object, and any related objects needed by any
-     * {@link org.dellroad.stuff.vaadin7.ProvidesProperty &#64;ProvidesProperty}-annotated methods,
-     * into the current {@link org.jsimpledb.SnapshotJTransaction}.
-     *
-     * <p>
-     * The implementation in {@link JObjectContainer} copies {@code jobj}, and all of {@code jobj}'s related objects returned
-     * by {@link #getDependencies getDependencies()}, via {@link JTransaction#copyTo(JTransaction, CopyState, Iterable)}.
-     * </p>
+     * Copy the given database object, and any related objects (as determined by {@link #getDependencies getDependencies()}),
+     * into the specified {@link org.jsimpledb.SnapshotJTransaction}.
      *
      * @param target the object to copy, or null (ignored)
+     * @param dest destination transaction
      * @param copyState tracks what's already been copied
-     * @return the copy of {@code target} in the current {@link org.jsimpledb.SnapshotJTransaction},
-     *  or null if {@code target} is null
+     * @return the copy of {@code target} in {@code dest}, or null if {@code target} is null
+     * @throws IllegalArgumentException if {@code dest} or {@code copyState} is null
      */
-    protected JObject copyOut(JObject target, CopyState copyState) {
+    protected JObject copyOut(JObject target, SnapshotJTransaction dest, CopyState copyState) {
+        if (dest == null)
+            throw new IllegalArgumentException("null dest");
+        if (copyState == null)
+            throw new IllegalArgumentException("null copyState");
+        if (target == null)
+            return null;
+        return this.copyOut(target, this.getDependencies(target), dest, copyState);
+    }
+
+    private JObject copyOut(JObject target, Iterable<? extends JObject> dependencies,
+      SnapshotJTransaction dest, CopyState copyState) {
 
         // Ignore null
         if (target == null)
@@ -488,24 +498,13 @@ public abstract class JObjectContainer extends SimpleKeyedContainer<ObjId, JObje
 
         // Copy out object
         final ObjId targetId = target.getObjId();
-        final JTransaction jtx = JTransaction.getCurrent();
-        final SnapshotJTransaction sjtx = jtx.getSnapshotTransaction();
-        final JObject copy = target.copyTo(sjtx, null, copyState);
+        final JTransaction jtx = target.getTransaction();
+        final JObject copy = target.copyTo(dest, null, copyState);
 
-        // Copy out (and track) related objects
-        Iterable<? extends JObject> dependencies = this.getDependencies(target);
+        // Copy out related objects
         if (dependencies != null) {
             dependencies = Iterables.filter(dependencies, JObject.class);                       // filter out nulls
-            jtx.copyTo(sjtx, copyState, dependencies);
-            for (JObject jobj : dependencies) {
-                final ObjId id = jobj.getObjId();
-                ObjIdSet affectedIds = this.dependenciesMap.get(id);
-                if (affectedIds == null) {
-                    affectedIds = new ObjIdSet();
-                    this.dependenciesMap.put(id, affectedIds);
-                }
-                affectedIds.add(targetId);
-            }
+            jtx.copyTo(dest, copyState, dependencies);
         }
 
         // Done

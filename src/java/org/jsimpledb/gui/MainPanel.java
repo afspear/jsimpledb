@@ -22,14 +22,12 @@ import org.jsimpledb.JObject;
 import org.jsimpledb.JSimpleDB;
 import org.jsimpledb.JTransaction;
 import org.jsimpledb.UntypedJObject;
-import org.jsimpledb.change.ObjectDelete;
 import org.jsimpledb.core.DeletedObjectException;
 import org.jsimpledb.core.ObjId;
 import org.jsimpledb.core.ReferencedObjectException;
 import org.jsimpledb.parse.ParseSession;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.transaction.annotation.Transactional;
 
 /**
@@ -77,9 +75,6 @@ public class MainPanel extends VerticalLayout {
     private final JSimpleDB jdb;
     private final ParseSession session;
     private final JObjectChooser objectChooser;
-
-    @Autowired(required = false)
-    private ChangePublisher changePublisher;
 
     public MainPanel(GUIConfig guiConfig) {
         this.guiConfig = guiConfig;
@@ -206,7 +201,7 @@ public class MainPanel extends VerticalLayout {
         }
 
         // Build title component from reference label
-        Object refLabel = MainPanel.this.objectChooser.getJObjectContainer().getContainerProperty(
+        final Object refLabel = MainPanel.this.objectChooser.getJObjectContainer().getContainerProperty(
           id, JObjectContainer.REFERENCE_LABEL_PROPERTY).getValue();
         final Component titleComponent = refLabel instanceof Component ? (Component)refLabel : new Label("" + refLabel);
 
@@ -219,12 +214,13 @@ public class MainPanel extends VerticalLayout {
     private JObject doCopyForEdit(ObjId id) {
 
         // Get object
-        final JObject jobj = JTransaction.getCurrent().getJObject(id);
+        final JTransaction jtx = JTransaction.getCurrent();
+        final JObject jobj = jtx.getJObject(id);
         if (!jobj.exists())
             return null;
 
         // Copy object and dependencies
-        return this.objectChooser.getJObjectContainer().copyOut(jobj, new CopyState());
+        return this.objectChooser.getJObjectContainer().copyOut(jobj, jtx.getSnapshotTransaction(), new CopyState());
     }
 
 // New
@@ -265,11 +261,7 @@ public class MainPanel extends VerticalLayout {
     @RetryTransaction
     @Transactional("jsimpledbGuiTransactionManager")
     private boolean doDelete(ObjId id) {
-        final JObject jobj = JTransaction.getCurrent().getJObject(id);
-        final boolean deleted = jobj.delete();
-        if (deleted && this.changePublisher != null)
-            this.changePublisher.publishChangeOnCommit(new ObjectDelete<Object>(jobj));
-        return deleted;
+        return JTransaction.getCurrent().getJObject(id).delete();
     }
 
 // Upgrade
@@ -301,10 +293,7 @@ public class MainPanel extends VerticalLayout {
         } catch (DeletedObjectException e) {
             return -1;
         }
-        final boolean upgraded = jobj.upgrade();
-        if (upgraded && this.changePublisher != null)
-            this.changePublisher.publishChangeOnCommit(jobj);
-        return upgraded ? oldVersion : 0;
+        return jobj.upgrade() ? oldVersion : 0;
     }
 
     @RetryTransaction

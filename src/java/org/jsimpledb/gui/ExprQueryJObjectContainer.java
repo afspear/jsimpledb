@@ -9,7 +9,6 @@ import com.google.common.collect.Iterables;
 
 import java.util.Collections;
 
-import org.dellroad.stuff.vaadin7.VaadinApplicationListener;
 import org.dellroad.stuff.vaadin7.VaadinConfigurable;
 import org.jsimpledb.JObject;
 import org.jsimpledb.JSimpleDB;
@@ -21,12 +20,9 @@ import org.jsimpledb.parse.expr.ExprParser;
 import org.jsimpledb.parse.expr.Node;
 import org.jsimpledb.util.CastFunction;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.context.event.ApplicationEventMulticaster;
 
 /**
  * {@link JObjectContainer} whose contents are determined by a Java expression.
- * Listens for {@link DataChangeEvent}s broadcast by an autowired {@link ApplicationEventMulticaster}.
  */
 @SuppressWarnings("serial")
 @VaadinConfigurable(preConstruction = true)
@@ -34,12 +30,10 @@ public class ExprQueryJObjectContainer extends JObjectContainer {
 
     private final ParseSession session;
 
-    private DataChangeListener dataChangeListener;
-    private String contentExpression;
+    @Autowired
+    private ChangePublisher changePublisher;
 
-    @Autowired(required = false)
-    @Qualifier("jsimpledbGuiEventMulticaster")
-    private ApplicationEventMulticaster eventMulticaster;
+    private String contentExpression;
 
     /**
      * Constructor.
@@ -115,34 +109,15 @@ public class ExprQueryJObjectContainer extends JObjectContainer {
     @Override
     public void connect() {
         super.connect();
-        if (this.eventMulticaster != null) {
-            this.dataChangeListener = new DataChangeListener();
-            this.dataChangeListener.register();
-        }
+        if (this.changePublisher != null)
+            this.changePublisher.addListeningContainer(this);
     }
 
     @Override
     public void disconnect() {
-        if (this.dataChangeListener != null) {
-            this.dataChangeListener.unregister();
-            this.dataChangeListener = null;
-        }
+        if (this.changePublisher != null)
+            this.changePublisher.removeListeningContainer(this);
         super.disconnect();
-    }
-
-// DataChangeListener
-
-    private class DataChangeListener extends VaadinApplicationListener<DataChangeEvent> {
-
-        DataChangeListener() {
-            super(ExprQueryJObjectContainer.this.eventMulticaster);
-            this.setAsynchronous(true);
-        }
-
-        @Override
-        protected void onApplicationEventInternal(DataChangeEvent event) {
-            ExprQueryJObjectContainer.this.handleChange(event.getChange());
-        }
     }
 }
 
