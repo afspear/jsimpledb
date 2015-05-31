@@ -143,6 +143,8 @@ public class RaftKVTransaction extends ForwardingKVStore implements KVTransactio
      *  <li>By this method being invoked with {@code identity} equal to this node's identity and a non-null {@code address},
      *      which creates a new cluster and adds this node to it.</li>
      * </ul>
+     *
+     * <p>
      * Therefore, this method must be used to intialize a new cluster.
      *
      * @param identity the identity of the node to add or remove
@@ -278,9 +280,9 @@ public class RaftKVTransaction extends ForwardingKVStore implements KVTransactio
         return this.getClass().getSimpleName()
           + "[txId=" + this.txId
           + ",state=" + this.state
-          + ",base=" + this.baseTerm + "/" + this.baseIndex
+          + ",base=" + this.baseIndex + "t" + this.baseTerm
           + (this.configChange != null ? ",configChange=" + Arrays.<String>asList(this.configChange) : "")
-          + (this.state.compareTo(TxState.COMMIT_WAITING) >= 0 ? ",commit=" + this.commitTerm + "/" + this.commitIndex : "")
+          + (this.state.compareTo(TxState.COMMIT_WAITING) >= 0 ? ",commit=" + this.commitIndex + "t" + this.commitTerm : "")
           + (this.timeout != 0 ? ",timeout=" + this.timeout : "")
           + "]";
     }
